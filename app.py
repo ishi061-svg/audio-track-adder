@@ -5,6 +5,9 @@
 #   画面にファイルをドラッグ＆ドロップしても入れられる（.mp4 と .mp3 を自動で振り分ける）
 # 追加：MP3 を最大4つまで一覧に入れ、トラック2〜5にする。「上へ」「下へ」「外す」で並びを直せる
 # 追加：合成中の進み具合を、棒と%で表示する
+# 追加：MP3 のほかに、M4A と WAV も入れられるようにする
+# 追加：元の音の扱い方を、3つから1つ選べるようにする
+#       足す（元の音はトラック1のまま）／入れ替える（元の音はトラック2へ）／上書きする（元の音は消す）
 #
 # 動かし方：python app.py
 # 必要な部品：tkinterdnd2（ドラッグ＆ドロップを受け取るため。入れ方：python -m pip install tkinterdnd2）
@@ -17,7 +20,20 @@ from tkinter import filedialog, ttk  # ttk：進み具合の棒（Progressbar）
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
-from add_audio import LAST_TRACK, MAX_ADDED, add_audio_tracks, make_output_path
+from add_audio import (ADD, AUDIO_SUFFIXES, LAST_TRACK, MAX_ADDED, ORIGINAL, OVERWRITE, SWAP, add_audio_tracks,
+                       count_streams, make_output_path, track_order)
+
+# 元の音の扱い方の選び方（画面に出す文と、add_audio に渡す印）
+MODES = [
+    ("足す（元の音はトラック1のまま）", ADD),
+    ("入れ替える（元の音はトラック2へ）", SWAP),
+    ("上書きする（元の音は消す）", OVERWRITE),
+]
+
+# ファイルを選ぶ画面で使う、拡張子の書き方（例：「*.mp3 *.m4a *.wav」）
+AUDIO_PATTERNS = " ".join("*" + suffix for suffix in AUDIO_SUFFIXES)
+# 画面に出す、使える形式の名前（例：「MP3・M4A・WAV」）
+AUDIO_NAMES = "・".join(suffix[1:].upper() for suffix in AUDIO_SUFFIXES)
 
 NAME_LIMIT = 36  # 画面に出すファイル名の、いちばん長い文字数（これより長い名前は、まん中を「…」で縮める）
 
@@ -36,7 +52,9 @@ class App:
     def __init__(self, root):
         self.root = root
         self.video_path = None  # 選んだ MP4
-        self.audio_paths = []   # 選んだ MP3 の一覧（並んでいる順に、トラック2・3・4・5 になる）
+        self.video_has_original = True  # 選んだ MP4 に、元の音が入っているか（トラック番号の表示に使う）
+        self.audio_paths = []   # 選んだ音の一覧（ふだんは、並んでいる順にトラック2・3・4・5 になる）
+        self.mode = tk.StringVar(value=ADD)  # 元の音の扱い方（ADD・SWAP・OVERWRITE のどれか）
         # 合成は別の流れ（スレッド）で動かすので、終わったことを画面に伝えるための受け渡し場所
         self.results = queue.Queue()
 
@@ -49,7 +67,7 @@ class App:
         # 説明
         tk.Label(
             frame,
-            text=f"MP4 の音をトラック1、MP3 をトラック2〜{LAST_TRACK} にした動画を作ります\n"
+            text=f"MP4 に、選んだ音（{AUDIO_NAMES}）を別のトラックとして入れた動画を作ります\n"
                  "ファイルは、この画面にドラッグ＆ドロップしても入れられます",
             anchor="w",
             justify="left",
@@ -60,8 +78,8 @@ class App:
         self.video_label = tk.Label(frame, text="まだ選んでいません", width=48, anchor="w", fg="gray")
         self.video_label.grid(row=1, column=1, sticky="w", padx=(10, 0))
 
-        # 2段目：MP3 を追加 ＋ 一覧
-        tk.Button(frame, text="MP3 を追加", width=12, command=self.choose_audio).grid(row=2, column=0, sticky="nw", pady=(8, 0))
+        # 2段目：音声を追加 ＋ 一覧
+        tk.Button(frame, text="音声を追加", width=12, command=self.choose_audio).grid(row=2, column=0, sticky="nw", pady=(8, 0))
         self.audio_list = tk.Listbox(frame, width=50, height=MAX_ADDED, activestyle="none", exportselection=False)
         self.audio_list.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=(8, 0))
 
@@ -72,30 +90,38 @@ class App:
         tk.Button(buttons, text="下へ", width=6, command=lambda: self.move_audio(1)).pack(side="left", padx=(4, 0))
         tk.Button(buttons, text="外す", width=6, command=self.remove_audio).pack(side="left", padx=(4, 0))
 
+        # 元の音の扱い方（3つから1つ選ぶ。変えると、一覧のトラック番号をすぐに書き直す）
+        tk.Label(frame, text="元の音").grid(row=4, column=0, sticky="nw", pady=(8, 0))
+        modes = tk.Frame(frame)
+        modes.grid(row=4, column=1, sticky="w", padx=(6, 0), pady=(8, 0))
+        for text, value in MODES:
+            tk.Radiobutton(modes, text=text, value=value, variable=self.mode,
+                           command=self.on_mode_changed).pack(anchor="w")
+
         # 保存先（MP4 を選ぶと表示する）
         # 保存先は長くなりやすいので、折り返して表示する（折り返す幅は、下で画面の幅に合わせる）
         self.output_label = tk.Label(frame, text="", anchor="w", justify="left", fg="gray")
-        self.output_label.grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.output_label.grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
-        # 合成するボタン（MP4 と MP3 を1つ以上選ぶまでは押せない）
+        # 合成するボタン（MP4 と音を1つ以上選ぶまでは押せない）
         self.merge_button = tk.Button(frame, text="合成する", width=16, state="disabled", command=self.start_merge)
-        self.merge_button.grid(row=5, column=0, columnspan=2, pady=(16, 0))
+        self.merge_button.grid(row=6, column=0, columnspan=2, pady=(16, 0))
 
         # 進み具合の棒（0〜100）。長さは下で、ボタンと一覧の幅に合わせる
         self.progress = ttk.Progressbar(frame, maximum=100, mode="determinate")
-        self.progress.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.progress.grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         # 結果の表示
         self.status_label = tk.Label(frame, text="", anchor="w", justify="left")
-        self.status_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.status_label.grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         self.refresh_audio_list()
 
         # 保存先と結果は、ボタンや一覧が並んだ部分の幅で折り返す
         # （それより広い幅で折り返すと、長い名前のときに画面が横に広がってしまう）
         root.update_idletasks()
-        # 1〜3段目（ボタンと一覧）が使っている幅（ピクセル）。文字の周りのわずかな余白の分を引いておく
-        wrap = frame.grid_bbox(0, 1, 1, 3)[2] - 8
+        # 1〜4段目（ボタンと一覧と、元の音の選び方）が使っている幅（ピクセル）。文字の周りのわずかな余白の分を引いておく
+        wrap = frame.grid_bbox(0, 1, 1, 4)[2] - 8
         self.output_label.config(wraplength=wrap)
         self.status_label.config(wraplength=wrap)
         self.progress.config(length=wrap)
@@ -113,27 +139,27 @@ class App:
             self.register_drop(child)
 
     def on_drop(self, event):
-        """ファイルが落とされたとき：拡張子を見て、MP4 の欄と MP3 の一覧に振り分ける"""
+        """ファイルが落とされたとき：拡張子を見て、MP4 の欄と音の一覧に振り分ける"""
         # 落とされたファイルの一覧は1つの文字列で届く。空白を含む名前は { } で囲まれているので、splitlist で分ける
         paths = [Path(p) for p in self.root.tk.splitlist(event.data)]
-        mp3s = []
+        audios = []
         unknown = []
         for path in paths:
             suffix = path.suffix.lower()  # 拡張子（.MP4 のような大文字も小文字にそろえる）
             if suffix == ".mp4":
                 self.set_video(path)
-            elif suffix == ".mp3":
-                mp3s.append(path)
+            elif suffix in AUDIO_SUFFIXES:
+                audios.append(path)
             else:
                 unknown.append(path.name)
 
-        # まとめて落とされた MP3 は、ファイル名の順に並べて足す
+        # まとめて落とされた音は、ファイル名の順に並べて足す
         # （Windows がファイルを渡す順番は、選び方によって変わることがあるため）
-        mp3s.sort(key=lambda p: p.name)
-        if mp3s:
-            self.add_audios(mp3s)
+        audios.sort(key=lambda p: p.name)
+        if audios:
+            self.add_audios(audios)
         if unknown:
-            self.show_error("MP4 か MP3 を入れてください：" + "、".join(unknown))
+            self.show_error(f"MP4 か {AUDIO_NAMES} を入れてください：" + "、".join(unknown))
         return event.action
 
     # ---------- ファイルを選ぶ ----------
@@ -145,7 +171,8 @@ class App:
 
     def choose_audio(self):
         # askopenfilenames（最後に s）は、まとめて何個か選べる
-        paths = filedialog.askopenfilenames(title="MP3 を追加", filetypes=[("MP3 音声", "*.mp3"), ("すべてのファイル", "*.*")])
+        paths = filedialog.askopenfilenames(title="音声を追加",
+                                            filetypes=[(f"音声（{AUDIO_NAMES}）", AUDIO_PATTERNS), ("すべてのファイル", "*.*")])
         if paths:
             self.add_audios([Path(p) for p in paths])
 
@@ -154,18 +181,30 @@ class App:
         self.video_path = path
         self.video_label.config(text=shorten(path.name), fg="black")
         self.output_label.config(text=f"保存先：{make_output_path(path)}")
+        # 元の音が入っているかを調べて、一覧のトラック番号を合わせる
+        # （読めないファイルや ffmpeg がないときは「入っている」としておく。くわしい理由は合成するときに出る）
+        try:
+            self.video_has_original = count_streams(path, "a") != 0
+        except RuntimeError:
+            self.video_has_original = True
+        self.refresh_audio_list(select=self.selected_index())
         self.update_button()
 
     def add_audios(self, paths):
-        """MP3 を一覧の最後に足す。入りきらない分は足さずに知らせる"""
+        """音を一覧の最後に足す。入りきらない分は足さずに知らせる"""
         room = MAX_ADDED - len(self.audio_paths)  # あと何個入るか
         self.audio_paths += paths[:room]
         self.refresh_audio_list()
         self.update_button()
         left_out = paths[room:]
         if left_out:
-            self.show_error(f"MP3 は{MAX_ADDED}つまでです（トラック{LAST_TRACK}まで）。入らなかったもの："
+            self.show_error(f"音のファイルは{MAX_ADDED}つまでです（トラック{LAST_TRACK}まで）。入らなかったもの："
                             + "、".join(p.name for p in left_out))
+
+    def on_mode_changed(self):
+        """元の音の扱い方を変えたとき：一覧のトラック番号を書き直す"""
+        self.refresh_audio_list(select=self.selected_index())
+        self.status_label.config(text="")
 
     # ---------- 一覧の並びを直す ----------
 
@@ -196,10 +235,14 @@ class App:
         self.update_button()
 
     def refresh_audio_list(self, select=None):
-        """一覧の表示を、今の audio_paths に合わせて書き直す"""
+        """一覧の表示を、今の audio_paths に合わせて書き直す
+        トラック番号は、合成と同じ track_order で決める（画面と、できあがる動画の番号がずれないように）"""
+        order = track_order(len(self.audio_paths), self.video_has_original, self.mode.get())
+        # 選んだ音の番号 → トラック番号（1 から）
+        track_of = {source: track for track, source in enumerate(order, start=1) if source != ORIGINAL}
         self.audio_list.delete(0, "end")
-        for number, path in enumerate(self.audio_paths, start=2):  # トラック2から数える
-            self.audio_list.insert("end", f"トラック{number}：{shorten(path.name)}")
+        for index, path in enumerate(self.audio_paths):
+            self.audio_list.insert("end", f"トラック{track_of[index]}：{shorten(path.name)}")
         if not self.audio_paths:
             self.audio_list.insert("end", "まだ選んでいません")
             self.audio_list.itemconfig(0, fg="gray")
@@ -209,7 +252,7 @@ class App:
     # ---------- 合成 ----------
 
     def update_button(self):
-        """MP4 と MP3（1つ以上）がそろっていれば「合成する」を押せるようにする"""
+        """MP4 と音（1つ以上）がそろっていれば「合成する」を押せるようにする"""
         ready = self.video_path is not None and len(self.audio_paths) > 0
         self.merge_button.config(state="normal" if ready else "disabled")
         self.status_label.config(text="")
@@ -223,6 +266,7 @@ class App:
         # 合成中に一覧が変えられても混ざらないように、今の選択を写し取っておく
         video_path = self.video_path
         audio_paths = list(self.audio_paths)
+        mode = self.mode.get()
         output_path = make_output_path(video_path)
         self.merge_button.config(state="disabled")
         self.progress.config(value=0)
@@ -234,7 +278,8 @@ class App:
 
         def work():
             try:
-                add_audio_tracks(video_path, audio_paths, output_path, on_progress=report)
+                add_audio_tracks(video_path, audio_paths, output_path, on_progress=report,
+                                 mode=mode)
                 self.results.put(("ok", f"できました：{output_path}"))
             except RuntimeError as error:  # 考えておいた失敗（理由が書いてある）
                 self.results.put(("ng", str(error)))
